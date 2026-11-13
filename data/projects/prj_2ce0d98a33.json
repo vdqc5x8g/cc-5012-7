@@ -1,0 +1,162 @@
+{
+  "id": "prj_2ce0d98a33",
+  "name": "手语字幕验收样例",
+  "video": {
+    "path": "/workspace/media/sample-signer.mp4",
+    "width": 1280,
+    "height": 720,
+    "fps": 25.0,
+    "duration": 12.52
+  },
+  "fonts": {
+    "regular": "/workspace/assets/fonts/SignCaptionSans-Regular.ttf",
+    "bold": "/workspace/assets/fonts/SignCaptionSans-Bold.ttf"
+  },
+  "cues": [
+    {
+      "id": "cue_a82ad6ae6e",
+      "start": 0.5,
+      "end": 3.5,
+      "text": "欢迎收看本期手语讲解，我们先看画面的左侧人物区域。"
+    },
+    {
+      "id": "cue_48bcaffe0c",
+      "start": 3.5,
+      "end": 6.0,
+      "text": "这一句字幕比较长，需要验证在移动的人物保护区之外能否稳定放置。"
+    },
+    {
+      "id": "cue_6599abad46",
+      "start": 6.0,
+      "end": 8.0,
+      "text": "接下来画面被重要图文完全占用，请检查无解报告。"
+    },
+    {
+      "id": "cue_1f3715f5e4",
+      "start": 8.0,
+      "end": 10.5,
+      "text": "恢复后字幕回到稳定位置，不应该上下跳动。"
+    },
+    {
+      "id": "cue_466e7de20e",
+      "start": 10.5,
+      "end": 12.5,
+      "text": "最后一句，验证过期的重要区域不再阻挡后续字幕。"
+    }
+  ],
+  "regions": [
+    {
+      "id": "reg_a10cea2813",
+      "label": "人物保护区（移动窗口）",
+      "kind": "signer",
+      "start": 0.0,
+      "end": 12.5,
+      "rect": [
+        220,
+        150,
+        380,
+        360
+      ],
+      "source": "manual",
+      "note": ""
+    },
+    {
+      "id": "reg_9bdc51db5a",
+      "label": "左侧互斥区域",
+      "kind": "sign",
+      "start": 0.0,
+      "end": 5.0,
+      "rect": [
+        40,
+        60,
+        300,
+        240
+      ],
+      "source": "manual",
+      "note": ""
+    },
+    {
+      "id": "reg_02281d9fa7",
+      "label": "右侧互斥区域",
+      "kind": "sign",
+      "start": 5.0,
+      "end": 8.5,
+      "rect": [
+        940,
+        300,
+        300,
+        240
+      ],
+      "source": "manual",
+      "note": ""
+    },
+    {
+      "id": "reg_cf59addc21",
+      "label": "过期的重要图文",
+      "kind": "important",
+      "start": 3.0,
+      "end": 7.5,
+      "rect": [
+        800,
+        80,
+        380,
+        300
+      ],
+      "source": "manual",
+      "note": ""
+    },
+    {
+      "id": "reg_dab5f4d2f9",
+      "label": "全画面占用",
+      "kind": "custom",
+      "start": 7.0,
+      "end": 8.0,
+      "rect": [
+        0,
+        0,
+        1280,
+        720
+      ],
+      "source": "manual",
+      "note": ""
+    }
+  ],
+  "settings": {
+    "font_size": 40.0,
+    "bold": false,
+    "max_lines": 2,
+    "max_chars_per_line": 16,
+    "safe_margin": 24.0,
+    "outline": 3.0,
+    "line_spacing": 1.18,
+    "sticky_tolerance_px": 36.0,
+    "min_font_ratio": 0.55,
+    "grid_step": 40.0,
+    "verify_threshold": 24
+  },
+  "placements": {},
+  "unsolved": {},
+  "revisions": [
+    {
+      "n": 1,
+      "kind": "project",
+      "at": 1794611450.7081735,
+      "actor": "human",
+      "summary": "创建工程",
+      "payload": {
+        "video": "/workspace/media/sample-signer.mp4"
+      }
+    },
+    {
+      "n": 2,
+      "kind": "project",
+      "at": 1794611450.7088842,
+      "actor": "fixture",
+      "summary": "导入验收样例标注",
+      "payload": {
+        "regions": 5
+      }
+    }
+  ],
+  "revCounter": 2
+}
