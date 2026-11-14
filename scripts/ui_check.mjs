@@ -68,40 +68,136 @@ check("候选方案展示", /候选\s*1/.test(bottomText));
 check("代价展示", bottomText.includes("代价"));
 check("采用按钮", (await page.$$(".candidate button")).length > 0);
 
-// 5. Move the caption by drag (downwards stays inside the safe area) and
-// confirm the human edit is persisted as a project revision.
-const range = await page.$(".transport input[type=range]");
+// 4b. 播放手语：点击播放后时间轴与视频帧同步推进。
+const playBtn = await page.$(".transport button");
+await playBtn.click();
+await sleep(1200);
+const t1 = await page.$eval(".transport .time", (el) => el.textContent);
+const vT1 = await page.$eval(".stage-frame video", (v) => v.currentTime);
+await sleep(700);
+const t2 = await page.$eval(".transport .time", (el) => el.textContent);
+const vT2 = await page.$eval(".stage-frame video", (v) => v.currentTime);
+await page.$eval(".transport button", (b) => b.click()); // pause
+check("播放手语视频时间推进", t1 !== t2 && vT2 > vT1, `${t1}→${t2} · video ${vT1.toFixed(2)}→${vT2.toFixed(2)}`);
+
+// 5. 变更前快照：人物保护区与遮挡来自真实 API（界面不得用固定数据冒充）。
+const projectId = await page.$eval(".topbar select", (el) => el.value);
+const snapBefore = await page.evaluate(async (pid) => {
+  const p = await (await fetch(`/api/projects/${pid}`)).json();
+  const cueId = p.cues[0].id;
+  const lay = p.layout.perCue[cueId];
+  return {
+    rev: p.revCounter,
+    cueId,
+    ink: lay.geometry ? lay.geometry.ink : null,
+    conflicts: lay.geometry ? lay.geometry.conflicts.length : null,
+    placementCount: Object.keys(p.placements).length,
+    regions: p.regions.map((r) => [r.id, ...r.rect.map(Math.round)]),
+    activeCount: p.regions.filter((r) => r.start <= 0.53 && 0.53 < r.end).length,
+  };
+}, projectId);
+const uiConflict = await page.$eval(".panel.right", (el) => {
+  const m = el.innerText.match(/遮挡冲突\s*(\d+)\s*处/);
+  return m ? Number(m[1]) : null;
+});
+check("界面遮挡计数与 API 一致（非固定数据）",
+  uiConflict !== null && uiConflict === snapBefore.conflicts,
+  `UI ${uiConflict} vs API ${snapBefore.conflicts}`);
+
+// 5b. 硬约束：把字幕拖进人物保护区必须被拒绝（保护手语区域仍是硬约束）。
+const stageBox = await (await page.$(".stage-frame")).boundingBox();
+const scale = stageBox.width / 1280;
 const cap = await page.$(".caption-block");
 check("字幕块可拖动（画布内）", cap !== null);
-const projectId = await page.$eval(".topbar select", (el) => el.value);
-if (cap) {
-  const before = await page.evaluate(async (pid) => {
-    const p = await (await fetch(`/api/projects/${pid}`)).json();
-    return p.revCounter;
-  }, projectId);
-  const box = await cap.boundingBox();
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-  // Small screen-space drag: at ~0.73 stage scale this is ~8 video px, safely
-  // inside the bottom safe margin. Larger drags may be rejected by validation
-  // (that is correct behaviour, covered separately by the 409 path).
-  await page.mouse.move(cx, cy);
+const capBox = await cap.boundingBox();
+const revBeforeBadDrag = snapBefore.rev;
+await page.mouse.move(capBox.x + capBox.width / 2, capBox.y + capBox.height / 2);
+await page.mouse.down();
+await page.mouse.move(stageBox.x + 410 * scale, stageBox.y + 330 * scale, { steps: 6 });
+await page.mouse.up();
+await sleep(1200);
+const badDrag = await page.evaluate(async (pid) => {
+  const p = await (await fetch(`/api/projects/${pid}`)).json();
+  return { rev: p.revCounter, placements: Object.keys(p.placements).length };
+}, projectId);
+const badToast = await page.$(".toast.bad");
+check("拖入人物保护区被拒绝（硬约束）",
+  badDrag.rev === revBeforeBadDrag && badDrag.placements === snapBefore.placementCount && badToast !== null,
+  `修订 ${revBeforeBadDrag}→${badDrag.rev} · placements ${snapBefore.placementCount}→${badDrag.placements}`);
+
+// 5c. 实际移动字幕到有效位置并保存（界面按钮调用真实布局实现）。
+// 拖拽移动的是当前字幕块（保持其行数/墨迹尺寸）；用真实 validate API 探测
+// 一个对该块有效且明显离开原位的目标位置（不伪造避让数据）。
+const probe = await page.evaluate(async (pid, cid) => {
+  const p = await (await fetch(`/api/projects/${pid}`)).json();
+  const geo = p.layout.perCue[cid].geometry;
+  const lines = geo.lines.map((l) => l.text);
+  const s = p.layout.settings;
+  const W = p.video.width, H = p.video.height;
+  for (let y = s.safe_margin + 5; y + geo.ink[3] <= H - s.safe_margin - 5; y += 40) {
+    for (let x = s.safe_margin + 5; x + geo.ink[2] <= W - s.safe_margin - 5; x += 40) {
+      if (Math.abs(x - geo.ink[0]) < 40 && Math.abs(y - geo.ink[1]) < 40) continue;
+      const v = await (await fetch(`/api/projects/${pid}/cues/${cid}/validate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ x, y, fontPx: geo.fontPx, lines }),
+      })).json();
+      if (v.valid) return { x, y, fontPx: geo.fontPx, lines };
+    }
+  }
+  return null;
+}, projectId, snapBefore.cueId);
+const target = probe;
+check("存在可移动到的有效候选位置", !!target,
+  target ? `目标 (${Math.round(target.x)}, ${Math.round(target.y)})` : "无");
+if (target) {
+  const cap2 = await page.$(".caption-block");
+  const box2 = await cap2.boundingBox();
+  await page.mouse.move(box2.x + box2.width / 2, box2.y + box2.height / 2);
   await page.mouse.down();
-  await page.mouse.move(cx, cy - 3, { steps: 3 });
-  await page.mouse.move(cx + 4, cy - 6, { steps: 3 });
+  await page.mouse.move(
+    stageBox.x + (target.x + snapBefore.ink[2] / 2) * scale,
+    stageBox.y + (target.y + snapBefore.ink[3] / 2) * scale,
+    { steps: 8 }
+  );
   await page.mouse.up();
   await sleep(1500);
-  const after = await page.evaluate(async (pid) => {
-    const p = await (await fetch(`/api/projects/${pid}`)).json();
-    return {
-      rev: p.revCounter,
-      placement: p.placements[Object.keys(p.placements)[0]] || null,
-    };
-  }, projectId);
-  check("拖动字幕保存为工程修订", after.rev > before, `修订 ${before} → ${after.rev}`);
-  check("手动位置写入 placements", after.placement !== null && after.placement.mode === "manual",
-    JSON.stringify(after.placement && { x: after.placement.x, y: after.placement.y, mode: after.placement.mode }));
 }
+const snapAfter = await page.evaluate(async (pid, cid) => {
+  const p = await (await fetch(`/api/projects/${pid}`)).json();
+  const lay = p.layout.perCue[cid];
+  const pl = p.placements[cid];
+  return {
+    rev: p.revCounter,
+    ink: lay.geometry ? lay.geometry.ink : null,
+    conflicts: lay.geometry ? lay.geometry.conflicts.length : null,
+    placement: pl ? { x: pl.x, y: pl.y, mode: pl.mode } : null,
+    regions: p.regions.map((r) => [r.id, ...r.rect.map(Math.round)]),
+  };
+}, projectId, snapBefore.cueId);
+check("移动字幕保存为工程修订", target && snapAfter.rev > revBeforeBadDrag,
+  `修订 ${revBeforeBadDrag} → ${snapAfter.rev}`);
+check("手动位置写入 placements",
+  target && snapAfter.placement && snapAfter.placement.mode === "manual"
+  && Math.abs(snapAfter.placement.x - target.x) <= 2 && Math.abs(snapAfter.placement.y - target.y) <= 2,
+  JSON.stringify(snapAfter.placement));
+
+// 5d. 变更前后对照：人物保护区不变，遮挡按新位置真实重算，界面与 API 一致。
+const regionsSame = JSON.stringify(snapBefore.regions) === JSON.stringify(snapAfter.regions);
+const moved = target && snapAfter.ink
+  && (Math.abs(snapAfter.ink[0] - snapBefore.ink[0]) > 20 || Math.abs(snapAfter.ink[1] - snapBefore.ink[1]) > 20);
+const uiConflictAfter = await page.$eval(".panel.right", (el) => {
+  const m = el.innerText.match(/遮挡冲突\s*(\d+)\s*处/);
+  return m ? Number(m[1]) : null;
+});
+check("变更前后人物保护区一致", regionsSame);
+check("字幕墨迹位置已实际移动", !!moved,
+  `${JSON.stringify(snapBefore.ink)} → ${JSON.stringify(snapAfter.ink)}`);
+check("变更后遮挡重算且界面与 API 一致",
+  uiConflictAfter !== null && uiConflictAfter === snapAfter.conflicts,
+  `UI ${uiConflictAfter} vs API ${snapAfter.conflicts}`);
+
+const range = await page.$(".transport input[type=range]");
 
 // 5b. Adopt a candidate and confirm the revision counter advances again.
 const beforeAdopt = await page.evaluate(async (pid) => {

@@ -59,15 +59,17 @@ npm test     # = python3 -m unittest discover -s backend/tests -v
 
 - `backend/tests/test_layout.py`：移动人物窗口、两块互斥区域、长句换行、全画面占用无解、部分遮挡分段、过期区域、轻微区域变化稳定性、未标注提示。
 - `backend/tests/test_export.py`：真实 FFmpeg 导出后用「同参数无字幕参考编码」做逐帧差异测量，断言越界 0、保护区侵入 0、完全遮挡时段无字幕像素。
+- `backend/tests/test_perf.py`：避让性能场景（快速手势+窄安全区）。避让查询优化前后输出逐字段一致、检查区间不减少、遮挡比例/布局耗时为真实测量；基准报告见 `python3 scripts/perf_avoidance.py` 与 [PERF.md](PERF.md)。
 
 ## 目录
 
 ```
-backend/signsub/   布局引擎（layout.py）、字形度量（fontmetrics.py）、ASS（ass.py）、FFmpeg 导出与核验（ffmpeg.py）、HTTP API（server.py）、辅助 CLI（cli.py）
+backend/signsub/   布局引擎（layout.py）、字形度量（fontmetrics.py）、ASS（ass.py）、FFmpeg 导出与核验（ffmpeg.py）、HTTP API（server.py）、辅助 CLI（cli.py）、避让性能场景（perf.py）
 frontend/src/      React 手语字幕编辑页（Stage / EditorPanel / InspectorPanel / CandidatePanel）
 assets/fonts/      内置字体（字号 == em 像素，与 libass 度量一致）
 media/             合成验收视频
 data/projects/     工程 JSON（含修订记录）
 data/exports/      导出视频与 ASS
-scripts/           setup.sh 与 run-server.mjs
+data/perf/         避让查询优化基准报告（scripts/perf_avoidance.py 生成）
+scripts/           setup.sh、run-server.mjs、ui_check.mjs（浏览器验收）、perf_avoidance.py（避让基准）
 ```

@@ -15,8 +15,10 @@ Design goals (mirrors the product requirements):
 from __future__ import annotations
 
 import math
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from .fontmetrics import TrueTypeFont, load_font
 from .model import AvoidRegion, CaptionCue, LayoutSettings, Project, Rect
@@ -36,6 +38,147 @@ CJK_RANGES = (
 def is_cjk(ch: str) -> bool:
     cp = ord(ch)
     return any(a <= cp <= b for a, b in CJK_RANGES)
+
+
+# ---------------------------------------------------------------------------
+# Avoidance query cost breakdown + reuse of still-valid geometry
+# ---------------------------------------------------------------------------
+#
+# 避让查询优化的计算顺序（详见 docs/PERF.md）：
+#   1. evaluate_timeline 逐条字幕评估；每条字幕先校验区域签名，快速动作或
+#      区域跳变会改变签名，旧候选立即失效（AvoidanceOptimizer.fresh）。
+#   2. 对整条字幕求活动区域并集（按 (start, end) 缓存）；能整段放置则结束。
+#   3. 否则按区域断点切分时间区间，逐区间求解——断点数量与求解次数不减少，
+#      短暂遮挡不会被跳过。
+#   4. 每个区间内：字号×宽度变体 → 换行（缓存）→ 墨迹度量（缓存）→
+#      候选位置网格（缓存）→ 安全区过滤 → 冲突检查（区域 Rect 预计算 +
+#      结果缓存）→ 评分 → 稳定性保持。
+#   5. 全部几何缓存键包含完整输入（区域矩形/时间、块尺寸、网格步长、文本、
+#      字号），命中即"仍然有效"；优化只省重复计算，不改变任何输出。
+
+
+@dataclass
+class StageCost:
+    """One stage of the avoidance query: calls, cache hits, time, work units."""
+
+    calls: int = 0
+    hits: int = 0
+    seconds: float = 0.0
+    units: int = 0  # points generated / box×region pairs / glyphs measured ...
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "hits": self.hits,
+            "seconds": round(self.seconds, 6),
+            "units": self.units,
+        }
+
+
+@dataclass
+class AvoidanceStats:
+    """成本分解：连续帧字幕避让中各查询阶段的成本与每条字幕的遮挡/耗时。"""
+
+    region_query: StageCost = field(default_factory=StageCost)
+    positions: StageCost = field(default_factory=StageCost)
+    conflicts: StageCost = field(default_factory=StageCost)
+    wrap: StageCost = field(default_factory=StageCost)
+    measure: StageCost = field(default_factory=StageCost)
+    occupancy: StageCost = field(default_factory=StageCost)
+    score_calls: int = 0
+    # 每条字幕的布局耗时（秒）与遮挡比例（活动区域对安全区的占用率）。
+    cue_layout_seconds: dict[str, float] = field(default_factory=dict)
+    occupancy_ratio: dict[str, float] = field(default_factory=dict)
+    # 每条字幕实际求解的时间区间数：检查帧密度的直接证据（不得减少）。
+    intervals_checked: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def total_layout_seconds(self) -> float:
+        return sum(self.cue_layout_seconds.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "regionQuery": self.region_query.to_dict(),
+            "positions": self.positions.to_dict(),
+            "conflicts": self.conflicts.to_dict(),
+            "wrap": self.wrap.to_dict(),
+            "measure": self.measure.to_dict(),
+            "occupancy": self.occupancy.to_dict(),
+            "scoreCalls": self.score_calls,
+            "cueLayoutSeconds": {k: round(v, 6) for k, v in self.cue_layout_seconds.items()},
+            "totalLayoutSeconds": round(self.total_layout_seconds, 6),
+            "occupancyRatio": {k: round(v, 4) for k, v in self.occupancy_ratio.items()},
+            "intervalsChecked": dict(self.intervals_checked),
+        }
+
+
+def _regions_signature(regions: list[AvoidRegion]) -> tuple:
+    """Identity of every region's geometry+time; any jump changes this."""
+    return tuple(
+        (r.id, r.kind, round(r.start, 6), round(r.end, 6),
+         tuple(round(v, 3) for v in r.rect))
+        for r in regions
+    )
+
+
+class AvoidanceOptimizer:
+    """Reuse of still-valid geometry within one timeline evaluation.
+
+    Every cache key contains the full geometric input of its computation, so a
+    hit means the reused value is still valid. `fresh()` re-checks the region
+    signature: fast gestures / region jumps invalidate all cached candidates
+    immediately. Nothing here reduces the number of checked intervals/frames.
+    """
+
+    def __init__(self, project: Project):
+        self._project = project
+        self._signature = _regions_signature(project.regions)
+        self.active: dict[tuple[float, float], list[AvoidRegion]] = {}
+        self.positions: dict[tuple, list[tuple[float, float]]] = {}
+        self.wrap: dict[tuple, list[str] | None] = {}
+        self.measure: dict[tuple, BlockMeasure] = {}
+        self.occupancy: dict[tuple, float] = {}
+        self.conflicts: dict[tuple, list[Conflict]] = {}
+        self.rects: dict[str, Rect] = {}
+
+    def fresh(self) -> bool:
+        """False (and fully cleared) when regions moved since last check."""
+        sig = _regions_signature(self._project.regions)
+        if sig == self._signature:
+            return True
+        self.__init__(self._project)
+        return False
+
+    def rect_of(self, region: AvoidRegion) -> Rect:
+        r = self.rects.get(region.id)
+        if r is None:
+            r = region.rect_obj()
+            self.rects[region.id] = r
+        return r
+
+
+class _AvoidCtx:
+    """Per-evaluation context: optional optimizer + optional stats."""
+
+    __slots__ = ("opt", "stats")
+
+    def __init__(self, opt: AvoidanceOptimizer | None = None,
+                 stats: AvoidanceStats | None = None):
+        self.opt = opt
+        self.stats = stats
+
+
+@contextmanager
+def _timed(stage: StageCost | None) -> Iterator[None]:
+    if stage is None:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        stage.seconds += time.perf_counter() - t0
+        stage.calls += 1
 
 
 @dataclass
@@ -373,6 +516,27 @@ def wrap_text(
     return lines
 
 
+def _wrap_ctx(font: TrueTypeFont, text: str, font_px: float, max_width: float,
+              max_lines: int, max_chars: int | None, ctx: _AvoidCtx | None) -> list[str] | None:
+    """wrap_text with reuse: identical (text, size, width) wraps are computed once."""
+    stats = ctx.stats if ctx else None
+    stage = stats.wrap if stats else None
+    opt = ctx.opt if ctx else None
+    with _timed(stage):
+        if opt is not None:
+            key = (text, round(font_px, 4), round(max_width, 4), max_lines, max_chars)
+            if key in opt.wrap:
+                if stage is not None:
+                    stage.hits += 1
+                return opt.wrap[key]
+        out = wrap_text(font, text, font_px, max_width, max_lines, max_chars)
+        if stage is not None:
+            stage.units += len(text)
+        if opt is not None:
+            opt.wrap[key] = out
+        return out
+
+
 @dataclass
 class BlockMeasure:
     lines: list[str]
@@ -408,6 +572,28 @@ def measure_block(
         bottom_offset=bottom_off,
         left_offset=left_off,
     )
+
+
+def _measure_ctx(font: TrueTypeFont, lines: list[str], font_px: float,
+                 line_spacing: float, ctx: _AvoidCtx | None) -> BlockMeasure:
+    """measure_block with reuse: identical (lines, size) blocks measured once."""
+    stats = ctx.stats if ctx else None
+    stage = stats.measure if stats else None
+    opt = ctx.opt if ctx else None
+    with _timed(stage):
+        if opt is not None:
+            key = (tuple(lines), round(font_px, 4), round(line_spacing, 4))
+            hit = opt.measure.get(key)
+            if hit is not None:
+                if stage is not None:
+                    stage.hits += 1
+                return hit
+        out = measure_block(font, lines, font_px, line_spacing)
+        if stage is not None:
+            stage.units += sum(len(ln) for ln in lines)
+        if opt is not None:
+            opt.measure[key] = out
+        return out
 
 
 def place_lines(
@@ -467,6 +653,28 @@ def _active_regions_for(project: Project, start: float, end: float) -> list[Avoi
     return sorted(out, key=lambda r: (r.start, r.id))
 
 
+def _active_regions_ctx(project: Project, start: float, end: float,
+                        ctx: _AvoidCtx | None) -> list[AvoidRegion]:
+    """Active-region query; reuses the still-valid set for identical spans."""
+    stats = ctx.stats if ctx else None
+    stage = stats.region_query if stats else None
+    opt = ctx.opt if ctx else None
+    key = (round(start, 6), round(end, 6))
+    with _timed(stage):
+        if stage is not None:
+            stage.units += len(project.regions)
+        if opt is not None:
+            hit = key in opt.active
+            if hit:
+                if stage is not None:
+                    stage.hits += 1
+                return opt.active[key]
+        out = _active_regions_for(project, start, end)
+        if opt is not None:
+            opt.active[key] = out
+        return out
+
+
 def _region_breakpoints(project: Project, cue: CaptionCue) -> list[float]:
     """Time points inside the cue where the active region set changes."""
     pts = {cue.start, cue.end}
@@ -487,9 +695,12 @@ def expand(rect: Rect, pad: float) -> Rect:
 
 
 def conflicts_for(box: Rect, regions: list[AvoidRegion]) -> list[Conflict]:
+    return _conflicts_with_rects(box, [(r, r.rect_obj()) for r in regions])
+
+
+def _conflicts_with_rects(box: Rect, region_rects: list[tuple[AvoidRegion, Rect]]) -> list[Conflict]:
     conflicts: list[Conflict] = []
-    for r in regions:
-        rr = r.rect_obj()
+    for r, rr in region_rects:
         inter = box.intersection(rr)
         if inter is None:
             continue
@@ -510,6 +721,31 @@ def conflicts_for(box: Rect, regions: list[AvoidRegion]) -> list[Conflict]:
     return conflicts
 
 
+def _conflicts_ctx(box: Rect, region_rects: list[tuple[AvoidRegion, Rect]],
+                   regions_sig: tuple, ctx: _AvoidCtx | None) -> list[Conflict]:
+    """Conflict check with precomputed region rects; result cached per box+set."""
+    stats = ctx.stats if ctx else None
+    stage = stats.conflicts if stats else None
+    opt = ctx.opt if ctx else None
+    if not region_rects:
+        return []
+    with _timed(stage):
+        if opt is not None:
+            key = (round(box.x, 3), round(box.y, 3), round(box.w, 3), round(box.h, 3),
+                   regions_sig)
+            hit = opt.conflicts.get(key)
+            if hit is not None:
+                if stage is not None:
+                    stage.hits += 1
+                return hit
+        if stage is not None:
+            stage.units += len(region_rects)
+        out = _conflicts_with_rects(box, region_rects)
+        if opt is not None:
+            opt.conflicts[key] = out
+        return out
+
+
 def occupancy(regions: list[AvoidRegion], safe: Rect, step: float = 12.0) -> float:
     """Fraction of the safe area covered by annotated regions (union)."""
     if safe.area() <= 0:
@@ -528,6 +764,31 @@ def occupancy(regions: list[AvoidRegion], safe: Rect, step: float = 12.0) -> flo
             x += step
         y += step
     return covered / total if total else 0.0
+
+
+def _occupancy_ctx(regions: list[AvoidRegion], safe: Rect, ctx: _AvoidCtx | None,
+                   step: float = 12.0) -> float:
+    """Occupancy query （遮挡比例）; cached per region-subset signature."""
+    stats = ctx.stats if ctx else None
+    stage = stats.occupancy if stats else None
+    opt = ctx.opt if ctx else None
+    with _timed(stage):
+        if opt is not None:
+            key = (_regions_signature(regions),
+                   (round(safe.x, 3), round(safe.y, 3), round(safe.w, 3), round(safe.h, 3)),
+                   step)
+            hit = opt.occupancy.get(key)
+            if hit is not None:
+                if stage is not None:
+                    stage.hits += 1
+                return hit
+        out = occupancy(regions, safe, step)
+        if stage is not None:
+            nx = max(0, int((safe.w or 0.0) / step))
+            stage.units += nx * max(0, int((safe.h or 0.0) / step))
+        if opt is not None:
+            opt.occupancy[key] = out
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +825,29 @@ def _positions(safe: Rect, w: float, h: float, step: float) -> list[tuple[float,
             y = min(max_y, safe.y + j * step)
             pts.append((x, y))
     return _dedupe_positions(pts)
+
+
+def _positions_ctx(safe: Rect, w: float, h: float, step: float,
+                   ctx: _AvoidCtx | None) -> list[tuple[float, float]]:
+    """Candidate grid; identical (safe, block, step) grids are generated once."""
+    stats = ctx.stats if ctx else None
+    stage = stats.positions if stats else None
+    opt = ctx.opt if ctx else None
+    with _timed(stage):
+        if opt is not None:
+            key = (round(safe.x, 3), round(safe.y, 3), round(safe.w, 3), round(safe.h, 3),
+                   round(w, 3), round(h, 3), round(step, 3))
+            hit = opt.positions.get(key)
+            if hit is not None:
+                if stage is not None:
+                    stage.hits += 1
+                return hit
+        out = _positions(safe, w, h, step)
+        if stage is not None:
+            stage.units += len(out)
+        if opt is not None:
+            opt.positions[key] = out
+        return out
 
 
 def _score(
@@ -603,12 +887,13 @@ def _score(
     return sum(parts.values()), parts
 
 
-def _interval_free_ratio(project: Project, interval: tuple[float, float]) -> float:
+def _interval_free_ratio(project: Project, interval: tuple[float, float],
+                         ctx: _AvoidCtx | None = None) -> float:
     s = project.settings
     safe = Rect(s.safe_margin, s.safe_margin,
                 project.width - 2 * s.safe_margin, project.height - 2 * s.safe_margin)
-    regs = _active_regions_for(project, interval[0], interval[1])
-    return 1.0 - occupancy(regs, safe)
+    regs = _active_regions_ctx(project, interval[0], interval[1], ctx)
+    return 1.0 - _occupancy_ctx(regs, safe, ctx)
 
 
 def _solve_static(
@@ -621,11 +906,21 @@ def _solve_static(
     adopted: Candidate | None = None,
     max_candidates: int = 8,
     window: tuple[float, float] | None = None,
+    ctx: _AvoidCtx | None = None,
 ) -> LayoutResult:
     s = project.settings
     pad = _outline_pad(s)
     safe = Rect(s.safe_margin, s.safe_margin,
                 project.width - 2 * s.safe_margin, project.height - 2 * s.safe_margin)
+    stats = ctx.stats if ctx else None
+    opt = ctx.opt if ctx else None
+    # Region rects are computed once per solve (not once per candidate box).
+    if opt is not None:
+        region_rects = [(r, opt.rect_of(r)) for r in regions]
+        regions_sig = _regions_signature(regions)
+    else:
+        region_rects = [(r, r.rect_obj()) for r in regions]
+        regions_sig = ()
     base_font = float(s.font_size)
     min_font = max(base_font * s.min_font_ratio, 16.0)
     sizes = []
@@ -651,14 +946,14 @@ def _solve_static(
         invalid_here: list[Candidate] = []
         variants = []
         for cap in width_caps:
-            lines = wrap_text(
+            lines = _wrap_ctx(
                 font, cue.text, font_px, cap, s.max_lines,
-                max_chars=s.max_chars_per_line or None,
+                s.max_chars_per_line or None, ctx,
             )
             if lines is None:
                 attempted.append({"fontPx": font_px, "widthCap": round(cap, 1), "result": "line-wrap failed"})
                 continue
-            block = measure_block(font, lines, font_px, s.line_spacing)
+            block = _measure_ctx(font, lines, font_px, s.line_spacing, ctx)
             if block.ink_w > safe.w + 1e-6 or block.ink_h > safe.h + 1e-6:
                 attempted.append({"fontPx": font_px, "widthCap": round(cap, 1), "result": "block exceeds safe area"})
                 continue
@@ -667,19 +962,21 @@ def _solve_static(
             continue
         used_sizes.append(font_px)
         for cap, block in variants:
-            for (x, y) in _positions(safe, block.ink_w, block.ink_h, s.grid_step):
+            for (x, y) in _positions_ctx(safe, block.ink_w, block.ink_h, s.grid_step, ctx):
                 padded = expand(Rect(x, y, block.ink_w, block.ink_h), pad)
                 if not (padded.x >= safe.x - 1e-6 and padded.y >= safe.y - 1e-6
                         and padded.right() <= safe.right() + 1e-6
                         and padded.bottom() <= safe.bottom() + 1e-6):
                     continue
-                cf = conflicts_for(padded, regions)
+                cf = _conflicts_ctx(padded, region_rects, regions_sig, ctx)
                 valid = not cf
                 cost, parts = _score(
                     Rect(x, y, block.ink_w, block.ink_h), safe, font_px, base_font,
                     len(block.lines), prev_box, s.sticky_tolerance_px,
                     project.height, project.width,
                 )
+                if stats is not None:
+                    stats.score_calls += 1
                 if not valid:
                     covered = sum(c.overlap_area for c in cf) / max(1.0, padded.area())
                     cost = 9000.0 + 1000.0 * covered
@@ -709,17 +1006,17 @@ def _solve_static(
             continue
         # Re-wrap at the reference font size to keep lines consistent.
         for cap in width_caps:
-            lines = wrap_text(font, cue.text, ref.font_px, cap, s.max_lines,
-                              max_chars=s.max_chars_per_line or None)
+            lines = _wrap_ctx(font, cue.text, ref.font_px, cap, s.max_lines,
+                              s.max_chars_per_line or None, ctx)
             if not lines:
                 continue
-            block = measure_block(font, lines, ref.font_px, s.line_spacing)
+            block = _measure_ctx(font, lines, ref.font_px, s.line_spacing, ctx)
             ref_padded = expand(Rect(ref.x, ref.y, block.ink_w, block.ink_h), pad)
             if not (ref_padded.x >= safe.x - 1e-6 and ref_padded.y >= safe.y - 1e-6
                     and ref_padded.right() <= safe.right() + 1e-6
                     and ref_padded.bottom() <= safe.bottom() + 1e-6):
                 continue
-            cf = conflicts_for(ref_padded, regions)
+            cf = _conflicts_ctx(ref_padded, region_rects, regions_sig, ctx)
             if cf:
                 continue
             sticky_candidate = Candidate(
@@ -746,7 +1043,7 @@ def _solve_static(
 
     geometry = None
     if chosen is not None:
-        block = measure_block(font, chosen.lines, chosen.font_px, s.line_spacing)
+        block = _measure_ctx(font, chosen.lines, chosen.font_px, s.line_spacing, ctx)
         lines, ink = place_lines(block, chosen.x, chosen.y, chosen.align)
         geometry = Geometry(
             cue_id=cue.id,
@@ -762,7 +1059,7 @@ def _solve_static(
 
     unsolved = None
     if chosen is None:
-        occ = occupancy(regions, safe)
+        occ = _occupancy_ctx(regions, safe, ctx)
         blockers = [
             {
                 "regionId": r.id,
@@ -833,6 +1130,7 @@ def evaluate_cue(
     prev_cue_id: str | None = None,
     adopted: Candidate | None = None,
     max_candidates: int = 8,
+    ctx: _AvoidCtx | None = None,
 ) -> LayoutResult:
     """Solve a cue whose regions may change within its time span.
 
@@ -844,11 +1142,18 @@ def evaluate_cue(
     If every sub-interval fails, the cue is UNSOLVED -- never shrunk to an
     unreadable size.
     """
-    union_regions = _active_regions(project, cue)
+    stats = ctx.stats if ctx else None
+    opt = ctx.opt if ctx else None
+    t0 = time.perf_counter() if stats is not None else 0.0
+    if opt is not None:
+        # 快速动作/区域跳变：签名变化立即失效全部旧候选。
+        opt.fresh()
+    union_regions = _active_regions_ctx(project, cue.start, cue.end, ctx)
     whole = _solve_static(project, cue, font, union_regions, prev, prev_cue_id, adopted,
-                          max_candidates)
+                          max_candidates, ctx=ctx)
     if whole.solved:
         whole.segments = [LayoutSegment(cue.start, cue.end, True, whole.geometry, None)]
+        _record_cue_stats(ctx, project, cue, union_regions, 1, t0)
         return whole
 
     points = _region_breakpoints(project, cue)
@@ -856,13 +1161,14 @@ def evaluate_cue(
     for a, b in zip(points, points[1:]):
         if b - a <= 1e-6:
             continue
-        regs = _active_regions_for(project, a, b)
+        regs = _active_regions_ctx(project, a, b, ctx)
         if intervals and [r.id for r in intervals[-1][2]] == [r.id for r in regs]:
             intervals[-1] = (intervals[-1][0], b, regs)
         else:
             intervals.append((a, b, regs))
     if len(intervals) <= 1:
         whole.segments = [LayoutSegment(cue.start, cue.end, False, None, whole.unsolved)]
+        _record_cue_stats(ctx, project, cue, union_regions, 1, t0)
         return whole
 
     segments: list[LayoutSegment] = []
@@ -871,7 +1177,7 @@ def evaluate_cue(
     running_prev = prev
     for (a, b, regs) in intervals:
         res = _solve_static(project, cue, font, regs, running_prev, prev_cue_id, adopted,
-                            max_candidates)
+                            max_candidates, ctx=ctx)
         if res.solved and res.geometry is not None:
             segments.append(LayoutSegment(a, b, True, res.geometry, None))
             solved_results.append(res)
@@ -886,18 +1192,48 @@ def evaluate_cue(
         # Report the first blocked interval so the UI can explain the gap.
         if failures:
             base.unsolved = failures[0][1].unsolved
+        _record_cue_stats(ctx, project, cue, union_regions, len(intervals), t0)
         return base
 
     # Nothing solvable: report the interval with the most free space.
-    best = max(failures, key=lambda f: (_interval_free_ratio(project, f[0]), f[0][1] - f[0][0]))
+    best = max(failures, key=lambda f: (_interval_free_ratio(project, f[0], ctx), f[0][1] - f[0][0]))
     best[1].segments = segments
+    _record_cue_stats(ctx, project, cue, union_regions, len(intervals), t0)
     return best[1]
 
 
-def evaluate_timeline(project: Project, font_bold: bool = False) -> dict[str, LayoutResult]:
-    """Evaluate all cues in time order, feeding each solved cue forward for stability."""
+def _record_cue_stats(ctx: _AvoidCtx | None, project: Project, cue: CaptionCue,
+                      union_regions: list[AvoidRegion], intervals: int, t0: float) -> None:
+    """Record per-cue 布局耗时 / 遮挡比例 / 检查区间数 (only when stats asked)."""
+    stats = ctx.stats if ctx else None
+    if stats is None:
+        return
+    stats.cue_layout_seconds[cue.id] = time.perf_counter() - t0
+    stats.intervals_checked[cue.id] = intervals
+    s = project.settings
+    safe = Rect(s.safe_margin, s.safe_margin,
+                project.width - 2 * s.safe_margin, project.height - 2 * s.safe_margin)
+    stats.occupancy_ratio[cue.id] = _occupancy_ctx(union_regions, safe, ctx)
+
+
+def evaluate_timeline(
+    project: Project,
+    font_bold: bool = False,
+    *,
+    stats: AvoidanceStats | None = None,
+    optimize: bool = True,
+) -> dict[str, LayoutResult]:
+    """Evaluate all cues in time order, feeding each solved cue forward for stability.
+
+    With ``optimize=True`` (default) an :class:`AvoidanceOptimizer` reuses
+    still-valid geometry across the continuous-frame evaluation; the reference
+    path (``optimize=False``) recomputes every query and is kept as the runtime
+    baseline for speed comparison. Both paths must produce identical results.
+    """
     font_path = project.font_bold_path if font_bold else project.font_path
     font = load_font(font_path)
+    opt = AvoidanceOptimizer(project) if optimize else None
+    ctx = _AvoidCtx(opt, stats)
     ordered = sorted(project.cues, key=lambda c: (c.start, c.id))
     results: dict[str, LayoutResult] = {}
     prev: Candidate | None = None
@@ -911,12 +1247,26 @@ def evaluate_timeline(project: Project, font_bold: bool = False) -> dict[str, La
                 lines=p.lines, align="center", valid=True, cost=0.0,
                 cost_parts={}, source="adopted", sticky=True,
             )
-        res = evaluate_cue(project, cue, font, prev=prev, prev_cue_id=prev_cue_id, adopted=adopted)
+        res = evaluate_cue(project, cue, font, prev=prev, prev_cue_id=prev_cue_id,
+                           adopted=adopted, ctx=ctx)
         results[cue.id] = res
         if res.chosen is not None:
             prev = res.chosen
             prev_cue_id = cue.id
     return results
+
+
+def evaluate_timeline_reference(
+    project: Project,
+    font_bold: bool = False,
+    *,
+    stats: AvoidanceStats | None = None,
+) -> dict[str, LayoutResult]:
+    """运行参照：未优化的避让查询路径（每次查询都重新计算）。
+
+    保留用于速度对比与回归校验；产品路径是 optimize=True 的 evaluate_timeline。
+    """
+    return evaluate_timeline(project, font_bold, stats=stats, optimize=False)
 
 
 def validate_placement(

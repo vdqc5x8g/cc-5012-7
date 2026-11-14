@@ -1,0 +1,213 @@
+{
+  "scenario": "fast-gesture-narrow-safe",
+  "project": {
+    "cues": 9,
+    "regions": 107,
+    "safeMargin": 88.0,
+    "gridStep": 28.0,
+    "frame": [
+      1280,
+      720
+    ],
+    "duration": 12.0
+  },
+  "reference": {
+    "wallSeconds": 3.802968,
+    "regionQuery": {
+      "calls": 90,
+      "hits": 0,
+      "seconds": 0.000209,
+      "units": 9630
+    },
+    "positions": {
+      "calls": 495,
+      "hits": 0,
+      "seconds": 1.729154,
+      "units": 222414
+    },
+    "conflicts": {
+      "calls": 182481,
+      "hits": 0,
+      "seconds": 1.108206,
+      "units": 1221120
+    },
+    "wrap": {
+      "calls": 670,
+      "hits": 0,
+      "seconds": 0.319543,
+      "units": 12242
+    },
+    "measure": {
+      "calls": 747,
+      "hits": 0,
+      "seconds": 0.046477,
+      "units": 13753
+    },
+    "occupancy": {
+      "calls": 22,
+      "hits": 0,
+      "seconds": 0.056162,
+      "units": 91080
+    },
+    "scoreCalls": 182324,
+    "cueLayoutSeconds": {
+      "pc1": 0.167431,
+      "pc2": 0.360771,
+      "pc3": 0.69185,
+      "pc9": 0.615544,
+      "pc4": 0.44448,
+      "pc5": 0.621694,
+      "pc6": 0.139336,
+      "pc7": 0.402572,
+      "pc8": 0.332215
+    },
+    "totalLayoutSeconds": 3.775893,
+    "occupancyRatio": {
+      "pc1": 0.6026,
+      "pc2": 0.7129,
+      "pc3": 1.0,
+      "pc9": 1.0,
+      "pc4": 0.7547,
+      "pc5": 0.7278,
+      "pc6": 0.6621,
+      "pc7": 0.7198,
+      "pc8": 0.5983
+    },
+    "intervalsChecked": {
+      "pc1": 1,
+      "pc2": 13,
+      "pc3": 14,
+      "pc9": 2,
+      "pc4": 13,
+      "pc5": 13,
+      "pc6": 1,
+      "pc7": 13,
+      "pc8": 11
+    }
+  },
+  "optimized": {
+    "wallSeconds": 1.570737,
+    "regionQuery": {
+      "calls": 90,
+      "hits": 2,
+      "seconds": 0.000194,
+      "units": 9630
+    },
+    "positions": {
+      "calls": 495,
+      "hits": 437,
+      "seconds": 0.222412,
+      "units": 27998
+    },
+    "conflicts": {
+      "calls": 182481,
+      "hits": 107789,
+      "seconds": 0.711139,
+      "units": 460229
+    },
+    "wrap": {
+      "calls": 670,
+      "hits": 511,
+      "seconds": 0.071896,
+      "units": 2808
+    },
+    "measure": {
+      "calls": 747,
+      "hits": 689,
+      "seconds": 0.003939,
+      "units": 1031
+    },
+    "occupancy": {
+      "calls": 22,
+      "hits": 11,
+      "seconds": 0.027476,
+      "units": 45540
+    },
+    "scoreCalls": 182324,
+    "cueLayoutSeconds": {
+      "pc1": 0.093312,
+      "pc2": 0.152529,
+      "pc3": 0.260141,
+      "pc9": 0.228934,
+      "pc4": 0.214219,
+      "pc5": 0.179938,
+      "pc6": 0.09902,
+      "pc7": 0.167622,
+      "pc8": 0.157433
+    },
+    "totalLayoutSeconds": 1.553148,
+    "occupancyRatio": {
+      "pc1": 0.6026,
+      "pc2": 0.7129,
+      "pc3": 1.0,
+      "pc9": 1.0,
+      "pc4": 0.7547,
+      "pc5": 0.7278,
+      "pc6": 0.6621,
+      "pc7": 0.7198,
+      "pc8": 0.5983
+    },
+    "intervalsChecked": {
+      "pc1": 1,
+      "pc2": 13,
+      "pc3": 14,
+      "pc9": 2,
+      "pc4": 13,
+      "pc5": 13,
+      "pc6": 1,
+      "pc7": 13,
+      "pc8": 11
+    }
+  },
+  "speedup": 2.421,
+  "identicalOutput": true,
+  "outputDiffs": [],
+  "intervalsExpected": {
+    "pc1": 13,
+    "pc2": 13,
+    "pc3": 14,
+    "pc4": 13,
+    "pc5": 13,
+    "pc6": 13,
+    "pc7": 13,
+    "pc8": 11,
+    "pc9": 2
+  },
+  "intervalsCheckedRef": {
+    "pc1": 1,
+    "pc2": 13,
+    "pc3": 14,
+    "pc9": 2,
+    "pc4": 13,
+    "pc5": 13,
+    "pc6": 1,
+    "pc7": 13,
+    "pc8": 11
+  },
+  "intervalsCheckedOpt": {
+    "pc1": 1,
+    "pc2": 13,
+    "pc3": 14,
+    "pc9": 2,
+    "pc4": 13,
+    "pc5": 13,
+    "pc6": 1,
+    "pc7": 13,
+    "pc8": 11
+  },
+  "coverageProblemsRef": [],
+  "coverageProblemsOpt": [],
+  "intervalsNotReduced": true,
+  "occupancyRatioIdentical": true,
+  "occupancyRatio": {
+    "pc1": 0.6025519848771267,
+    "pc2": 0.7129017013232514,
+    "pc3": 1.0,
+    "pc9": 1.0,
+    "pc4": 0.754725897920605,
+    "pc5": 0.7277882797731569,
+    "pc6": 0.6620982986767486,
+    "pc7": 0.7197542533081286,
+    "pc8": 0.5982986767485823
+  }
+}
